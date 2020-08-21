@@ -1,7 +1,7 @@
 #include <linux/module.h>
 #include <linux/usb.h>
 #include <linux/spi/spi.h>
-//#include "ftdi.h"
+#include <linux/workqueue.h>
 
 #define SIO_SET_BITMODE_REQUEST 0x0B
 #define SIO_RESET               0x00
@@ -21,6 +21,8 @@ struct ftdi_priv {
   struct spi_transfer *current_transfer;
   u32 received_bytes;
   struct spi_device *spi_dev;
+
+  struct work_struct register_spi_ctrl;
 };
 
 static struct spi_board_info slave_info = {
@@ -116,27 +118,43 @@ static int spi_transfer_one(struct spi_master *ctlr, struct spi_device *spi, str
   return 1;
 }
 
-void my_complete(struct urb * urb) {
-  printk("transfer done\n");
+void ftx232_urb_init_complete(struct urb * urb) {
   struct ftdi_priv *priv = urb->context;
   int ret;
 
   if(priv->state == 0) {
-    priv->req.bRequestType = (USB_TYPE_VENDOR | USB_DIR_OUT);
+    priv->req.bRequestType = USB_TYPE_VENDOR | USB_DIR_OUT;
     priv->req.bRequest = SIO_SET_BITMODE_REQUEST;
     priv->req.wValue = 0x200 | pindir;
     priv->req.wIndex = priv->channel;
     priv->req.wLength = 0;
-    usb_fill_control_urb(urb, urb->dev, usb_sndctrlpipe(urb->dev, 0), (unsigned char*)&priv->req, NULL, 0, my_complete, priv); 
+    usb_fill_control_urb(urb, urb->dev, usb_sndctrlpipe(urb->dev, 0), (unsigned char*)&priv->req, NULL, 0, ftx232_urb_init_complete, priv);
 
     ret = usb_submit_urb(urb, GFP_KERNEL);
     if(ret != 0) {
       printk("submit: %d\n", ret);
     }
   } else if(priv->state == 1)  {
+    schedule_work(&priv->register_spi_ctrl);
   }
 
   priv->state++;
+}
+
+static void ftx232_register_spi_ctrl(struct work_struct *work) {
+  int ret;
+  struct ftdi_priv *priv;
+  priv = container_of(work, struct ftdi_priv, register_spi_ctrl);
+
+  ret = spi_register_master(priv->spi_controller);
+  if(ret) {
+    printk("register master failed: %d\n", ret);
+  }
+
+  priv->spi_dev = spi_new_device(priv->spi_controller, &slave_info);
+  if(!priv->spi_dev) {
+    printk("Failed to alocate spi device\r\n");
+  }
 }
 
 static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_device_id* usb_id) {
@@ -148,13 +166,14 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   struct usb_endpoint_descriptor *epd;
   struct ftdi_priv *priv;
 
+  settings = usb_if->cur_altsetting;
+
   master = spi_alloc_master(&usb_if->dev, sizeof(struct ftdi_priv));
   if(!master) {
     printk("spi alloc master");
     return -ENOMEM;
   }
-
-  settings = usb_if->cur_altsetting;
+  master->transfer_one = spi_transfer_one;
 
   priv = spi_master_get_devdata(master);
   usb_set_intfdata(usb_if, priv);
@@ -165,27 +184,8 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
     return -ENODEV;
   }
 
+  INIT_WORK(&priv->register_spi_ctrl, ftx232_register_spi_ctrl);
   printk("Channel %x\r\n", priv->channel);
-  master->transfer_one = spi_transfer_one;
-
-  struct urb *urb = usb_alloc_urb(0, GFP_KERNEL);
-  if(!urb) {
-    printk("could not allocate urb\r\n");
-    return -ENOMEM;
-  }
-
-  priv->req.bRequestType = (USB_TYPE_VENDOR | USB_DIR_OUT);
-  priv->req.bRequest = SIO_RESET;
-  priv->req.wValue = SIO_RESET;
-  priv->req.wIndex = priv->channel;
-  priv->req.wLength = 0;
-  usb_fill_control_urb(urb, udev, usb_sndctrlpipe(udev, 0), (unsigned char*)&priv->req, NULL, 0, my_complete, priv); 
-
-  ret = usb_submit_urb(urb, GFP_KERNEL);
-  if(ret != 0) {
-    printk("submit: %d\n", ret);
-  }
-
 
   priv->urb = usb_alloc_urb(0, GFP_KERNEL);
   if(!priv->urb) {
@@ -193,30 +193,18 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
     return -ENOMEM;
   }
 
-  for(i = 0; i < settings->desc.bNumEndpoints; i++) {
-    epd = &settings->endpoint[i].desc;
-    printk("endpoint=%d type=%d in=%d addr=%d\n", 
-      i,
-      usb_endpoint_type(epd),
-      usb_endpoint_dir_in(epd),
-      usb_endpoint_num(epd)
-    );
+  // reset FTDI
+  priv->req.bRequestType = USB_TYPE_VENDOR | USB_DIR_OUT;
+  priv->req.bRequest = SIO_RESET;
+  priv->req.wValue = SIO_RESET;
+  priv->req.wIndex = priv->channel;
+  priv->req.wLength = 0;
+  usb_fill_control_urb(priv->urb, udev, usb_sndctrlpipe(udev, 0), (unsigned char*) &priv->req, NULL, 0, ftx232_urb_init_complete, priv); 
+  ret = usb_submit_urb(priv->urb, GFP_KERNEL);
+  if(ret != 0) {
+    printk("submit: %d\n", ret);
   }
 
-  msleep(300);
-  ret = spi_register_master(priv->spi_controller);
-  if(ret) {
-    printk("register master failed: %d\n", ret);
-    return ret;
-  }
-
-  priv->spi_dev = spi_new_device(priv->spi_controller, &slave_info);
-  if(!priv->spi_dev) {
-    printk("Failed to alocate spi device\r\n");
-    return -ENOMEM;
-  }
-
-  printk("OK\r\n");
   return 0;
 }
 
