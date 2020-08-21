@@ -32,14 +32,9 @@ static struct spi_board_info slave_info = {
   .irq = 42,
 };
 
-void my_completespi2(struct urb * urb) {
-  struct ftdi_priv *priv = urb->context;
-  printk("spi rx done\n");
-  memcpy(priv->current_transfer->rx_buf, priv->data + 2, priv->current_transfer->len);
-}
-
-void my_completespi(struct urb * urb) {
+void ftx232_urb_spi_transfer_complete(struct urb * urb) {
   int ret;
+  u32 remaining;
   struct ftdi_priv *priv = urb->context;
   bool in_pipe = urb->pipe & USB_DIR_IN;
 
@@ -48,7 +43,7 @@ void my_completespi(struct urb * urb) {
     priv->received_bytes += urb->actual_length - 2;
   }
 
-  u32 remaining = priv->current_transfer->len - priv->received_bytes;
+  remaining = priv->current_transfer->len - priv->received_bytes;
   if(remaining > 0) {
     usb_fill_bulk_urb(
         priv->urb,
@@ -56,7 +51,7 @@ void my_completespi(struct urb * urb) {
         usb_rcvbulkpipe(priv->usb_dev, 2 * priv->channel - 1),
         priv->data,
         remaining + 2,
-        my_completespi,
+        ftx232_urb_spi_transfer_complete,
         priv
     );
     ret = usb_submit_urb(priv->urb, GFP_KERNEL);
@@ -70,22 +65,21 @@ void my_completespi(struct urb * urb) {
 
 u8 pindir = 0b1011;
 
-static int spi_transfer_one(struct spi_master *ctlr, struct spi_device *spi, struct spi_transfer* t) {
-  int len = 0;
+static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *spi, struct spi_transfer* t) {
+  int len;
   int ret;
-  struct ftdi_priv *priv = spi_master_get_devdata(ctlr);
-
-  t->speed_hz = 1000;
+  struct ftdi_priv *priv;
 
   if(!t->tx_buf || !t->rx_buf) {
     printk("tx_buf or rx_buf is empty\n");
     return -EINVAL;
   }
 
-
+  priv = spi_master_get_devdata(ctlr);
   priv->current_transfer = t;
   priv->received_bytes = 0;
 
+  len = 0;
   priv->data[len++] = SET_BITS_LOW;
   priv->data[len++] = 0;
   priv->data[len++] = pindir;
@@ -106,7 +100,7 @@ static int spi_transfer_one(struct spi_master *ctlr, struct spi_device *spi, str
       usb_sndbulkpipe(priv->usb_dev, 2 * priv->channel),
       priv->data,
       len,
-      my_completespi,
+      ftx232_urb_spi_transfer_complete,
       priv
   );
 
@@ -123,6 +117,7 @@ void ftx232_urb_init_complete(struct urb * urb) {
   int ret;
 
   if(priv->state == 0) {
+    // set MPSSE mode
     priv->req.bRequestType = USB_TYPE_VENDOR | USB_DIR_OUT;
     priv->req.bRequest = SIO_SET_BITMODE_REQUEST;
     priv->req.wValue = 0x200 | pindir;
@@ -162,8 +157,6 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   struct usb_device *udev = interface_to_usbdev(usb_if);
   struct usb_host_interface *settings;
   int ret;
-  int i;
-  struct usb_endpoint_descriptor *epd;
   struct ftdi_priv *priv;
 
   settings = usb_if->cur_altsetting;
@@ -173,7 +166,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
     printk("spi alloc master");
     return -ENOMEM;
   }
-  master->transfer_one = spi_transfer_one;
+  master->transfer_one = ftx232_spi_transfer_one;
 
   priv = spi_master_get_devdata(master);
   usb_set_intfdata(usb_if, priv);
