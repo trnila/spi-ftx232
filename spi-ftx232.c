@@ -6,11 +6,14 @@
 #include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/gpio/machine.h>
+#include <linux/completion.h>
 
 #define SIO_SET_BITMODE_REQUEST 0x0B
 #define SIO_RESET               0x00
 #define SET_BITS_LOW            0x80
 #define SET_BITS_HIGH           0x82
+#define READ_BITS_LOW           0x81
+#define READ_BITS_HIGH          0x83
 #define MPSSE_WRITE_NEG         0x01
 #define MPSSE_DO_WRITE          0x10
 #define MPSSE_DO_READ           0x20
@@ -39,6 +42,12 @@ struct ftdi_priv {
   struct work_struct register_spi_ctrl;
   struct gpio_chip gpio_chip;
   spinlock_t lock;
+};
+
+struct ftdi_gpio_input_req {
+  u8 data[3];
+  struct ftdi_priv *priv;
+  struct completion completion;
 };
 
 void ftx232_urb_spi_transfer_complete(struct urb * urb) {
@@ -225,6 +234,90 @@ static int ftx232_gpio_direction_output(struct gpio_chip *chip, unsigned offset,
   return 0;
 }
 
+static int ftx232_gpio_direction_input(struct gpio_chip *chip, unsigned offset) {
+  struct ftdi_priv *priv;
+
+  priv = gpiochip_get_data(chip);
+  spin_lock(&priv->lock);
+  priv->pindir &= ~(1 << (offset + GPIO_OFFSET));
+  spin_unlock(&priv->lock);
+  return 0;
+}
+
+void ftx232_urb_gpio_complete(struct urb *urb) {
+  struct ftdi_gpio_input_req *req = urb->context;
+  struct ftdi_priv *priv = req->priv;
+  int ret;
+
+  if(urb->pipe & USB_DIR_IN) {
+    complete(&req->completion);
+    usb_free_urb(urb);
+  } else {
+    usb_fill_bulk_urb(
+        urb,
+        priv->usb_dev,
+        usb_rcvbulkpipe(priv->usb_dev, 2 * priv->channel - 1),
+        req->data,
+        sizeof(req->data),
+        ftx232_urb_gpio_complete,
+        req
+    );
+
+    ret = usb_submit_urb(urb, GFP_KERNEL);
+    if(ret != 0) {
+      printk("submit: %d\n", ret);
+    }
+  }
+}
+
+static int ftx232_gpio_get(struct gpio_chip *chip, unsigned offset) {
+  struct urb *urb;
+  struct ftdi_priv *priv;
+  struct ftdi_gpio_input_req *req;
+  int hw_offset;
+  int ret;
+  int state;
+
+  priv = gpiochip_get_data(chip);
+
+  urb = usb_alloc_urb(0, GFP_KERNEL);
+  if(!urb) {
+    printk("could not allocate urb\r\n");
+    return -ENOMEM;
+  }
+
+  req = kmalloc(sizeof(*req), GFP_KERNEL);
+  if(!req) {
+    printk("Failed to allocate memory\n");
+    return -ENOMEM;
+  }
+  init_completion(&req->completion);
+  req->priv = priv;
+  hw_offset = offset + GPIO_OFFSET;
+  req->data[0] = hw_offset < 8 ? READ_BITS_LOW : READ_BITS_HIGH;
+
+  usb_fill_bulk_urb(
+      urb,
+      priv->usb_dev,
+      usb_sndbulkpipe(priv->usb_dev, 2 * priv->channel),
+      req->data,
+      1,
+      ftx232_urb_gpio_complete,
+      req
+  );
+
+  ret = usb_submit_urb(urb, GFP_KERNEL);
+  if(ret != 0) {
+    printk("submit: %d\n", ret);
+  }
+
+  wait_for_completion(&req->completion);
+  state = req->data[2] & (1 << (hw_offset < 8 ? hw_offset : hw_offset - 8));
+  kfree(req);
+  return state;
+}
+
+
 static ssize_t export_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t len) {
   struct spi_device *spi_device;
   struct ftdi_priv *priv;
@@ -325,9 +418,11 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
 
   priv->gpio_chip.owner = THIS_MODULE;
   priv->gpio_chip.ngpio = 13;
+  priv->gpio_chip.direction_output = ftx232_gpio_direction_output;
   priv->gpio_chip.set = ftx232_gpio_chip_set;
   priv->gpio_chip.set_multiple = ftx232_gpio_chip_set_multiple;
-  priv->gpio_chip.direction_output = ftx232_gpio_direction_output;
+  priv->gpio_chip.direction_input = ftx232_gpio_direction_input;
+  priv->gpio_chip.get = ftx232_gpio_get;
 
   ret = devm_gpiochip_add_data(&usb_if->dev, &priv->gpio_chip, priv);
   if(!ret) {
