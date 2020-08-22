@@ -4,7 +4,10 @@ Two independent SPI controllers with maximal speed of 30 Mhz and 12 chip selects
 Each SPI device can be managed by existing kernel driver or userspace application through spidev.
 Unused chip selects are accessible as GPIOs with the maximal number of 24 pins.
 
-## Build
+## Build & Run
+
+Currently, the `ftdi_sio` driver should be unloaded or USB PID and VID should be changed in the FTDI and driver.
+
 ```sh
 $ make
 $ insmod ./spi-ftx232.ko
