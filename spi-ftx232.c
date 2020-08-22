@@ -84,9 +84,8 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   struct ftdi_priv *priv;
   struct ftdi_usb_packet *packet;
 
-  if(!t->tx_buf || !t->rx_buf) {
-    printk("tx_buf or rx_buf is empty\n");
-    return -EINVAL;
+  if(t->len <= 0) {
+    return 0;
   }
 
   priv = spi_master_get_devdata(ctlr);
@@ -96,7 +95,7 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   packet = &priv->packet;
 
   packet->len = 0;
-  ftx232_gpio_set(priv, packet, spi->chip_select, 0);
+  ftx232_gpio_set(priv, packet, spi->chip_select, spi->mode & SPI_CS_HIGH);
 
   packet->data[packet->len++] = MPSSE_DO_WRITE | MPSSE_WRITE_NEG | MPSSE_DO_READ;
   packet->data[packet->len++] = (t->len - 1) & 0xFF;
@@ -104,7 +103,7 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   memcpy(packet->data + packet->len, t->tx_buf, t->len);
   packet->len += t->len;
 
-  ftx232_gpio_set(priv, packet, spi->chip_select, 1);
+  ftx232_gpio_set(priv, packet, spi->chip_select, !(spi->mode & SPI_CS_HIGH));
 
   usb_fill_bulk_urb(
       priv->urb,
@@ -124,7 +123,13 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   return 1;
 }
 
-void ftx232_urb_init_complete(struct urb * urb) {
+static void ftx232_urb_spi_dispose(struct urb *urb) {
+  struct ftdi_usb_packet *packet = urb->context;
+  kfree(packet);
+  usb_free_urb(urb);
+}
+
+static void ftx232_urb_init_complete(struct urb * urb) {
   struct ftdi_priv *priv = urb->context;
   int ret;
 
@@ -151,11 +156,15 @@ void ftx232_urb_init_complete(struct urb * urb) {
 static ssize_t export_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t len) {
   struct spi_device *spi_device;
   struct ftdi_priv *priv;
+  struct ftdi_usb_packet *packet;
+  struct urb *urb;
   char modalias[SPI_NAME_SIZE];
-  int chip_select;
+  u32 chip_select;
+  u32 mode;
+  u32 max_speed_hz;
   int ret;
 
-  if(sscanf(buf, "%32s %d", modalias, &chip_select) != 2) {
+  if(sscanf(buf, "%32s %u %x %u", modalias, &chip_select, &mode, &max_speed_hz) != 4) {
     return -EINVAL;
   }
 
@@ -169,7 +178,8 @@ static ssize_t export_store(struct device *dev, struct device_attribute *attr, c
 
   strncpy(spi_device->modalias, modalias, sizeof(modalias));
   spi_device->chip_select = chip_select;
-  spi_device->max_speed_hz = 10000000;
+  spi_device->mode = mode;
+  spi_device->max_speed_hz = max_speed_hz;
 
   ret = spi_add_device(spi_device);
   if(ret) {
@@ -178,6 +188,31 @@ static ssize_t export_store(struct device *dev, struct device_attribute *attr, c
 
   // set gpio pin as an output
   priv->pindir |= 1 << (chip_select + GPIO_OFFSET);
+
+  urb = usb_alloc_urb(0, GFP_KERNEL);
+  if(!urb) {
+    printk("could not allocate urb\r\n");
+    return -ENOMEM;
+  }
+
+  packet = kmalloc(sizeof(*packet), GFP_KERNEL);
+  packet->len = 0;
+  ftx232_gpio_set(priv, packet, chip_select, !(mode & SPI_CS_HIGH));
+
+  usb_fill_bulk_urb(
+      urb,
+      priv->usb_dev,
+      usb_sndbulkpipe(priv->usb_dev, 2 * priv->channel),
+      packet->data,
+      packet->len,
+      ftx232_urb_spi_dispose,
+      packet
+  );
+
+  ret = usb_submit_urb(urb, GFP_KERNEL);
+  if(ret != 0) {
+    printk("submit: %d\n", ret);
+  }
 
   return len;
 }
@@ -216,6 +251,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   }
   master->transfer_one = ftx232_spi_transfer_one;
   master->num_chipselect = 13;
+  master->mode_bits |= SPI_CS_HIGH;
 
   priv = spi_master_get_devdata(master);
   usb_set_intfdata(usb_if, priv);
