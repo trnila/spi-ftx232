@@ -6,9 +6,12 @@
 #define SIO_SET_BITMODE_REQUEST 0x0B
 #define SIO_RESET               0x00
 #define SET_BITS_LOW            0x80
+#define SET_BITS_HIGH           0x82
 #define MPSSE_WRITE_NEG         0x01
 #define MPSSE_DO_WRITE          0x10
 #define MPSSE_DO_READ           0x20
+
+#define GPIO_OFFSET 3
 
 struct ftdi_priv {
   u8 channel;
@@ -16,20 +19,15 @@ struct ftdi_priv {
   int state;
   struct usb_device *usb_dev;
   u8 data[4096];
+  int len;
   struct urb *urb;
   struct spi_controller *spi_controller;
   struct spi_transfer *current_transfer;
   u32 received_bytes;
   struct spi_device *spi_dev;
-
+  u32 pinstate;
+  u32 pindir;
   struct work_struct register_spi_ctrl;
-};
-
-static struct spi_board_info slave_info = {
-  .modalias = "spidev",
-  .chip_select = 0,
-  .max_speed_hz = 30000000,
-  .irq = 42,
 };
 
 void ftx232_urb_spi_transfer_complete(struct urb * urb) {
@@ -63,10 +61,21 @@ void ftx232_urb_spi_transfer_complete(struct urb * urb) {
   }
 }
 
-u8 pindir = 0b1011;
+static void ftx232_gpio_set(struct ftdi_priv *priv, u32 gpio, bool value) {
+  bool low = gpio + GPIO_OFFSET < 8;
+
+  if(value) {
+    priv->pinstate |= 1 << (gpio + GPIO_OFFSET);
+  } else {
+    priv->pinstate &= ~(1 << (gpio + GPIO_OFFSET));
+  }
+
+  priv->data[priv->len++] = gpio + GPIO_OFFSET < 8 ? SET_BITS_LOW : SET_BITS_HIGH; 
+  priv->data[priv->len++] = priv->pinstate >> (low ? 0 : 8);
+  priv->data[priv->len++] = priv->pindir >> (low ? 0 : 8);
+}
 
 static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *spi, struct spi_transfer* t) {
-  int len;
   int ret;
   struct ftdi_priv *priv;
 
@@ -79,27 +88,23 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   priv->current_transfer = t;
   priv->received_bytes = 0;
 
-  len = 0;
-  priv->data[len++] = SET_BITS_LOW;
-  priv->data[len++] = 0;
-  priv->data[len++] = pindir;
+  priv->len = 0;
+  ftx232_gpio_set(priv, spi->chip_select, 0);
 
-  priv->data[len++] = MPSSE_DO_WRITE | MPSSE_WRITE_NEG | MPSSE_DO_READ;
-  priv->data[len++] = (t->len - 1) & 0xFF;
-  priv->data[len++] = ((t->len - 1) >> 8) & 0xFF;
-  memcpy(priv->data + len, t->tx_buf, t->len);
-  len += t->len;
+  priv->data[priv->len++] = MPSSE_DO_WRITE | MPSSE_WRITE_NEG | MPSSE_DO_READ;
+  priv->data[priv->len++] = (t->len - 1) & 0xFF;
+  priv->data[priv->len++] = ((t->len - 1) >> 8) & 0xFF;
+  memcpy(priv->data + priv->len, t->tx_buf, t->len);
+  priv->len += t->len;
 
-  priv->data[len++] = SET_BITS_LOW;
-  priv->data[len++] = 0b1000;
-  priv->data[len++] = pindir;
+  ftx232_gpio_set(priv, spi->chip_select, 1);
 
   usb_fill_bulk_urb(
       priv->urb,
       priv->usb_dev,
       usb_sndbulkpipe(priv->usb_dev, 2 * priv->channel),
       priv->data,
-      len,
+      priv->len,
       ftx232_urb_spi_transfer_complete,
       priv
   );
@@ -120,7 +125,7 @@ void ftx232_urb_init_complete(struct urb * urb) {
     // set MPSSE mode
     priv->req.bRequestType = USB_TYPE_VENDOR | USB_DIR_OUT;
     priv->req.bRequest = SIO_SET_BITMODE_REQUEST;
-    priv->req.wValue = 0x200 | pindir;
+    priv->req.wValue = 0x200 | priv->pindir;
     priv->req.wIndex = priv->channel;
     priv->req.wLength = 0;
     usb_fill_control_urb(urb, urb->dev, usb_sndctrlpipe(urb->dev, 0), (unsigned char*)&priv->req, NULL, 0, ftx232_urb_init_complete, priv);
@@ -136,6 +141,42 @@ void ftx232_urb_init_complete(struct urb * urb) {
   priv->state++;
 }
 
+static ssize_t export_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t len) {
+  struct spi_device *spi_device;
+  struct ftdi_priv *priv;
+  char modalias[SPI_NAME_SIZE];
+  int chip_select;
+  int ret;
+
+  if(sscanf(buf, "%32s %d", modalias, &chip_select) != 2) {
+    return -EINVAL;
+  }
+
+  priv = dev_get_drvdata(dev);
+
+  spi_device = spi_alloc_device(priv->spi_controller);
+  if(!spi_device) {
+    printk("Failed to allocate spi device");
+    return -EINVAL;
+  }
+
+  strncpy(spi_device->modalias, modalias, sizeof(modalias));
+  spi_device->chip_select = chip_select;
+  spi_device->max_speed_hz = 10000000;
+
+  ret = spi_add_device(spi_device);
+  if(ret) {
+    printk("spi_add_device: %d\n", ret);
+  }
+
+  // set gpio pin as an output
+  priv->pindir |= 1 << (chip_select + GPIO_OFFSET);
+
+  return len;
+}
+
+DEVICE_ATTR_WO(export);
+
 static void ftx232_register_spi_ctrl(struct work_struct *work) {
   int ret;
   struct ftdi_priv *priv;
@@ -146,9 +187,9 @@ static void ftx232_register_spi_ctrl(struct work_struct *work) {
     printk("register master failed: %d\n", ret);
   }
 
-  priv->spi_dev = spi_new_device(priv->spi_controller, &slave_info);
-  if(!priv->spi_dev) {
-    printk("Failed to alocate spi device\r\n");
+  ret = device_create_file(&priv->spi_controller->dev, &dev_attr_export);
+  if(ret) {
+    printk("device_create_file: %d\n", ret);
   }
 }
 
@@ -167,11 +208,13 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
     return -ENOMEM;
   }
   master->transfer_one = ftx232_spi_transfer_one;
+  master->num_chipselect = 13;
 
   priv = spi_master_get_devdata(master);
   usb_set_intfdata(usb_if, priv);
   priv->spi_controller = master;
   priv->usb_dev = udev;
+  priv->pindir = 0b011; // MISO in, MOSI out, CLK out
   priv->channel = settings->desc.bInterfaceNumber + 1;
   if(priv->channel == 2) {
     return -ENODEV;
@@ -207,7 +250,6 @@ static void ftx232_usb_disconnect(struct usb_interface *usb_if) {
 
   spi_unregister_device(priv->spi_dev);
   spi_unregister_controller(priv->spi_master);
-  printk("DC test\r\n");
 }
 
 static const struct usb_device_id ftx232_usb_table[] = {
