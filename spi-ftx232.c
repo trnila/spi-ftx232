@@ -13,13 +13,17 @@
 
 #define GPIO_OFFSET 3
 
+struct ftdi_usb_packet {
+  u8 data[4096];
+  int len;
+};
+
 struct ftdi_priv {
   u8 channel;
   struct usb_ctrlrequest req;
   int state;
   struct usb_device *usb_dev;
-  u8 data[4096];
-  int len;
+  struct ftdi_usb_packet packet;
   struct urb *urb;
   struct spi_controller *spi_controller;
   struct spi_transfer *current_transfer;
@@ -37,7 +41,7 @@ void ftx232_urb_spi_transfer_complete(struct urb * urb) {
   bool in_pipe = urb->pipe & USB_DIR_IN;
 
   if(in_pipe) {
-    memcpy(priv->current_transfer->rx_buf + priv->received_bytes, priv->data + 2, urb->actual_length - 2);
+    memcpy(priv->current_transfer->rx_buf + priv->received_bytes, priv->packet.data + 2, urb->actual_length - 2);
     priv->received_bytes += urb->actual_length - 2;
   }
 
@@ -47,7 +51,7 @@ void ftx232_urb_spi_transfer_complete(struct urb * urb) {
         priv->urb,
         priv->usb_dev,
         usb_rcvbulkpipe(priv->usb_dev, 2 * priv->channel - 1),
-        priv->data,
+        priv->packet.data,
         remaining + 2,
         ftx232_urb_spi_transfer_complete,
         priv
@@ -61,7 +65,7 @@ void ftx232_urb_spi_transfer_complete(struct urb * urb) {
   }
 }
 
-static void ftx232_gpio_set(struct ftdi_priv *priv, u32 gpio, bool value) {
+static void ftx232_gpio_set(struct ftdi_priv *priv, struct ftdi_usb_packet *packet, u32 gpio, bool value) {
   bool low = gpio + GPIO_OFFSET < 8;
 
   if(value) {
@@ -70,14 +74,15 @@ static void ftx232_gpio_set(struct ftdi_priv *priv, u32 gpio, bool value) {
     priv->pinstate &= ~(1 << (gpio + GPIO_OFFSET));
   }
 
-  priv->data[priv->len++] = gpio + GPIO_OFFSET < 8 ? SET_BITS_LOW : SET_BITS_HIGH; 
-  priv->data[priv->len++] = priv->pinstate >> (low ? 0 : 8);
-  priv->data[priv->len++] = priv->pindir >> (low ? 0 : 8);
+  packet->data[packet->len++] = gpio + GPIO_OFFSET < 8 ? SET_BITS_LOW : SET_BITS_HIGH; 
+  packet->data[packet->len++] = priv->pinstate >> (low ? 0 : 8);
+  packet->data[packet->len++] = priv->pindir >> (low ? 0 : 8);
 }
 
 static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *spi, struct spi_transfer* t) {
   int ret;
   struct ftdi_priv *priv;
+  struct ftdi_usb_packet *packet;
 
   if(!t->tx_buf || !t->rx_buf) {
     printk("tx_buf or rx_buf is empty\n");
@@ -88,23 +93,25 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   priv->current_transfer = t;
   priv->received_bytes = 0;
 
-  priv->len = 0;
-  ftx232_gpio_set(priv, spi->chip_select, 0);
+  packet = &priv->packet;
 
-  priv->data[priv->len++] = MPSSE_DO_WRITE | MPSSE_WRITE_NEG | MPSSE_DO_READ;
-  priv->data[priv->len++] = (t->len - 1) & 0xFF;
-  priv->data[priv->len++] = ((t->len - 1) >> 8) & 0xFF;
-  memcpy(priv->data + priv->len, t->tx_buf, t->len);
-  priv->len += t->len;
+  packet->len = 0;
+  ftx232_gpio_set(priv, packet, spi->chip_select, 0);
 
-  ftx232_gpio_set(priv, spi->chip_select, 1);
+  packet->data[packet->len++] = MPSSE_DO_WRITE | MPSSE_WRITE_NEG | MPSSE_DO_READ;
+  packet->data[packet->len++] = (t->len - 1) & 0xFF;
+  packet->data[packet->len++] = ((t->len - 1) >> 8) & 0xFF;
+  memcpy(packet->data + packet->len, t->tx_buf, t->len);
+  packet->len += t->len;
+
+  ftx232_gpio_set(priv, packet, spi->chip_select, 1);
 
   usb_fill_bulk_urb(
       priv->urb,
       priv->usb_dev,
       usb_sndbulkpipe(priv->usb_dev, 2 * priv->channel),
-      priv->data,
-      priv->len,
+      packet->data,
+      packet->len,
       ftx232_urb_spi_transfer_complete,
       priv
   );
