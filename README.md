@@ -1,5 +1,8 @@
 # USB SPI + GPIO Linux driver for FTDI FT2232, FT232
 Linux driver makes accessible SPI bus and GPIO pins through USB FTDI FT2232 even on your desktop!
+Two independent SPI controllers with maximal speed of 30 Mhz and 12 chip selects per channel.
+Each SPI device can be managed by existing kernel driver or userspace application through spidev.
+Unused chip selects are accessible as GPIOs with the maximal number of 24 pins.
 
 ## Build
 ```sh
