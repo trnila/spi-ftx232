@@ -17,6 +17,8 @@
 #define MPSSE_WRITE_NEG         0x01
 #define MPSSE_DO_WRITE          0x10
 #define MPSSE_DO_READ           0x20
+#define DISABLE_DIV_5           0x8a
+#define SET_CLK_DIVISOR         0x86
 
 #define GPIO_CLK 0
 #define GPIO_OFFSET 3
@@ -97,6 +99,14 @@ static void ftx232_fill_gpio_cmd(struct ftdi_priv *priv, struct ftdi_usb_packet 
   spin_unlock(&priv->lock);
 }
 
+static void ftx232_fill_clk_divisor(struct ftdi_usb_packet *packet, u32 max_speed_hz) {
+  u32 value = (30000000UL + max_speed_hz) / max_speed_hz - 1;
+  packet->data[packet->len++] = SET_CLK_DIVISOR;
+  packet->data[packet->len++] = value & 0xFF;
+  packet->data[packet->len++] = (value & 0xFF00) >> 8;
+  printk("%d\n", value);
+}
+
 static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *spi, struct spi_transfer* t) {
   int ret;
   struct ftdi_priv *priv;
@@ -115,6 +125,11 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
 
   packet->len = 0;
 
+  // change the clock to frequency required by the transfer
+  if(t->speed_hz != 0 && t->speed_hz != spi->max_speed_hz) {
+    ftx232_fill_clk_divisor(&priv->packet, t->speed_hz);
+  }
+
   spin_lock(&priv->lock);
   if(spi->mode & SPI_CPOL) {
     priv->pinstate |= 1 << GPIO_CLK;
@@ -122,6 +137,8 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
     priv->pinstate &= ~(1 << GPIO_CLK);
   }
   spin_unlock(&priv->lock);
+
+  // activate CS
   ftx232_fill_gpio_cmd(priv, packet, spi->chip_select, spi->mode & SPI_CS_HIGH);
 
   cmd = MPSSE_DO_WRITE | MPSSE_DO_READ;
@@ -135,7 +152,13 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   memcpy(packet->data + packet->len, t->tx_buf, t->len);
   packet->len += t->len;
 
+  // deactivate CS
   ftx232_fill_gpio_cmd(priv, packet, spi->chip_select, !(spi->mode & SPI_CS_HIGH));
+
+  // optionally revert the previous clock
+  if(t->speed_hz != 0 && t->speed_hz != spi->max_speed_hz) {
+    ftx232_fill_clk_divisor(&priv->packet, spi->max_speed_hz);
+  }
 
   usb_fill_bulk_urb(
       priv->urb,
@@ -179,10 +202,71 @@ static void ftx232_urb_init_complete(struct urb * urb) {
       printk("submit: %d\n", ret);
     }
   } else if(priv->state == 1)  {
+    priv->packet.len = 0;
+    priv->packet.data[priv->packet.len++] = DISABLE_DIV_5;
+
+    usb_fill_bulk_urb(
+        urb,
+        priv->usb_dev,
+        usb_sndbulkpipe(priv->usb_dev, 2 * priv->channel),
+        priv->packet.data,
+        priv->packet.len,
+        ftx232_urb_init_complete,
+        priv
+    );
+
+    ret = usb_submit_urb(urb, GFP_KERNEL);
+    if(ret != 0) {
+      printk("submit: %d\n", ret);
+    }
+  } else if(priv->state == 2) {
     schedule_work(&priv->register_spi_ctrl);
   }
 
   priv->state++;
+}
+
+static int ftx232_spi_setup(struct spi_device *spi) {
+  struct ftdi_priv *priv;
+  struct ftdi_usb_packet *packet;
+  struct urb *urb;
+  int ret;
+
+  if(spi->max_speed_hz == 0) {
+    printk("max_speed_hz must be greater than zero\n");
+    return -EINVAL;
+  }
+
+  priv = spi_master_get_devdata(spi->controller);
+
+  urb = usb_alloc_urb(0, GFP_KERNEL);
+  if(!urb) {
+    printk("could not allocate urb\r\n");
+    return -ENOMEM;
+  }
+
+  printk("setting the clock: %d\r\n", spi->max_speed_hz);
+
+  packet = kmalloc(sizeof(*packet), GFP_KERNEL);
+  packet->len = 0;
+  ftx232_fill_clk_divisor(packet, spi->max_speed_hz);
+
+  usb_fill_bulk_urb(
+      urb,
+      priv->usb_dev,
+      usb_sndbulkpipe(priv->usb_dev, 2 * priv->channel),
+      packet->data,
+      packet->len,
+      ftx232_urb_spi_dispose,
+      packet
+  );
+
+  ret = usb_submit_urb(urb, GFP_KERNEL);
+  if(ret != 0) {
+    printk("submit: %d\n", ret);
+  }
+
+  return 0;
 }
 
 void ftx232_gpio_chip_set(struct gpio_chip *chip, unsigned offset, int value) {
@@ -397,6 +481,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
     return -ENOMEM;
   }
   master->transfer_one = ftx232_spi_transfer_one;
+  master->setup = ftx232_spi_setup;
   master->num_chipselect = 13;
   master->mode_bits |= SPI_CS_HIGH | SPI_CPOL | SPI_CPHA;
 
