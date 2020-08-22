@@ -491,9 +491,6 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   priv->usb_dev = udev;
   priv->pindir = 0b011; // MISO in, MOSI out, CLK out
   priv->channel = settings->desc.bInterfaceNumber + 1;
-  if(priv->channel == 2) {
-    return -ENODEV;
-  }
 
   priv->gpio_chip.label = kmalloc(32, GFP_KERNEL);
   if(!priv->gpio_chip.label) {
@@ -503,6 +500,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
 
   priv->gpio_chip.owner = THIS_MODULE;
   priv->gpio_chip.ngpio = 13;
+  priv->gpio_chip.base = -1;
   priv->gpio_chip.direction_output = ftx232_gpio_direction_output;
   priv->gpio_chip.set = ftx232_gpio_chip_set;
   priv->gpio_chip.set_multiple = ftx232_gpio_chip_set_multiple;
