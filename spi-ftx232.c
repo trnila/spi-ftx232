@@ -317,7 +317,12 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
     return -ENODEV;
   }
 
-  priv->gpio_chip.label = "x";
+  priv->gpio_chip.label = kmalloc(32, GFP_KERNEL);
+  if(!priv->gpio_chip.label) {
+    return -ENOMEM;
+  }
+  snprintf(priv->gpio_chip.label, 32, "ftx232 chan %d", priv->channel);
+
   priv->gpio_chip.owner = THIS_MODULE;
   priv->gpio_chip.ngpio = 13;
   priv->gpio_chip.set = ftx232_gpio_chip_set;
