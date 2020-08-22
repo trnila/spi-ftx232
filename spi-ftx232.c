@@ -11,6 +11,7 @@
 #define MPSSE_DO_WRITE          0x10
 #define MPSSE_DO_READ           0x20
 
+#define GPIO_CLK 0
 #define GPIO_OFFSET 3
 
 struct ftdi_usb_packet {
@@ -65,7 +66,7 @@ void ftx232_urb_spi_transfer_complete(struct urb * urb) {
   }
 }
 
-static void ftx232_gpio_set(struct ftdi_priv *priv, struct ftdi_usb_packet *packet, u32 gpio, bool value) {
+static void ftx232_fill_gpio_cmd(struct ftdi_priv *priv, struct ftdi_usb_packet *packet, u32 gpio, bool value) {
   bool low = gpio + GPIO_OFFSET < 8;
 
   if(value) {
@@ -83,6 +84,7 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   int ret;
   struct ftdi_priv *priv;
   struct ftdi_usb_packet *packet;
+  u8 cmd;
 
   if(t->len <= 0) {
     return 0;
@@ -95,15 +97,26 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
   packet = &priv->packet;
 
   packet->len = 0;
-  ftx232_gpio_set(priv, packet, spi->chip_select, spi->mode & SPI_CS_HIGH);
 
-  packet->data[packet->len++] = MPSSE_DO_WRITE | MPSSE_WRITE_NEG | MPSSE_DO_READ;
+  if(spi->mode & SPI_CPOL) {
+    priv->pinstate |= 1 << GPIO_CLK;
+  } else {
+    priv->pinstate &= ~(1 << GPIO_CLK);
+  }
+  ftx232_fill_gpio_cmd(priv, packet, spi->chip_select, spi->mode & SPI_CS_HIGH);
+
+  cmd = MPSSE_DO_WRITE | MPSSE_DO_READ;
+  if(!spi->mode & SPI_CPHA) {
+    cmd |= MPSSE_WRITE_NEG;
+  }
+
+  packet->data[packet->len++] = cmd;
   packet->data[packet->len++] = (t->len - 1) & 0xFF;
   packet->data[packet->len++] = ((t->len - 1) >> 8) & 0xFF;
   memcpy(packet->data + packet->len, t->tx_buf, t->len);
   packet->len += t->len;
 
-  ftx232_gpio_set(priv, packet, spi->chip_select, !(spi->mode & SPI_CS_HIGH));
+  ftx232_fill_gpio_cmd(priv, packet, spi->chip_select, !(spi->mode & SPI_CS_HIGH));
 
   usb_fill_bulk_urb(
       priv->urb,
@@ -197,7 +210,7 @@ static ssize_t export_store(struct device *dev, struct device_attribute *attr, c
 
   packet = kmalloc(sizeof(*packet), GFP_KERNEL);
   packet->len = 0;
-  ftx232_gpio_set(priv, packet, chip_select, !(mode & SPI_CS_HIGH));
+  ftx232_fill_gpio_cmd(priv, packet, chip_select, !(mode & SPI_CS_HIGH));
 
   usb_fill_bulk_urb(
       urb,
@@ -251,7 +264,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   }
   master->transfer_one = ftx232_spi_transfer_one;
   master->num_chipselect = 13;
-  master->mode_bits |= SPI_CS_HIGH;
+  master->mode_bits |= SPI_CS_HIGH | SPI_CPOL | SPI_CPHA;
 
   priv = spi_master_get_devdata(master);
   usb_set_intfdata(usb_if, priv);
