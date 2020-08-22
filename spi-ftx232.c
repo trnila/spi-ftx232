@@ -3,6 +3,9 @@
 #include <linux/spi/spi.h>
 #include <linux/workqueue.h>
 #include <linux/gpio/driver.h>
+#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
+#include <linux/gpio/machine.h>
 
 #define SIO_SET_BITMODE_REQUEST 0x0B
 #define SIO_RESET               0x00
@@ -210,12 +213,7 @@ static int ftx232_gpio_direction_output(struct gpio_chip *chip, unsigned offset,
   struct ftdi_priv *priv;
 
   priv = gpiochip_get_data(chip);
-  if(value) {
-    priv->pindir |= 1 << (offset + GPIO_OFFSET);
-  } else {
-    priv->pindir &= ~(1 << (offset + GPIO_OFFSET));
-  }
-
+  priv->pindir |= 1 << (offset + GPIO_OFFSET);
   ftx232_gpio_chip_set(chip, offset, value);
   return 0;
 }
@@ -253,9 +251,15 @@ static ssize_t export_store(struct device *dev, struct device_attribute *attr, c
     printk("spi_add_device: %d\n", ret);
   }
 
-  // set gpio pin as an output
-  priv->pindir |= 1 << (chip_select + GPIO_OFFSET);
-  ftx232_gpio_chip_set(&priv->gpio_chip, chip_select, !(mode & SPI_CS_HIGH));
+  char label[32];
+  snprintf(label, sizeof(label), "ftx232 chan %d cs %d", priv->channel, chip_select);
+  gpiochip_request_own_desc(
+      &priv->gpio_chip,
+      chip_select,
+      label,
+      (mode & SPI_CS_HIGH) ? GPIO_ACTIVE_HIGH : GPIO_ACTIVE_LOW,
+      GPIOD_OUT_LOW
+  );
 
   return len;
 }
