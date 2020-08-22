@@ -38,6 +38,7 @@ struct ftdi_priv {
   u32 pindir;
   struct work_struct register_spi_ctrl;
   struct gpio_chip gpio_chip;
+  spinlock_t lock;
 };
 
 void ftx232_urb_spi_transfer_complete(struct urb * urb) {
@@ -74,6 +75,7 @@ void ftx232_urb_spi_transfer_complete(struct urb * urb) {
 static void ftx232_fill_gpio_cmd(struct ftdi_priv *priv, struct ftdi_usb_packet *packet, u32 gpio, bool value) {
   bool low = gpio + GPIO_OFFSET < 8;
 
+  spin_lock(&priv->lock);
   if(value) {
     priv->pinstate |= 1 << (gpio + GPIO_OFFSET);
   } else {
@@ -83,6 +85,7 @@ static void ftx232_fill_gpio_cmd(struct ftdi_priv *priv, struct ftdi_usb_packet 
   packet->data[packet->len++] = gpio + GPIO_OFFSET < 8 ? SET_BITS_LOW : SET_BITS_HIGH; 
   packet->data[packet->len++] = priv->pinstate >> (low ? 0 : 8);
   packet->data[packet->len++] = priv->pindir >> (low ? 0 : 8);
+  spin_unlock(&priv->lock);
 }
 
 static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *spi, struct spi_transfer* t) {
@@ -103,11 +106,13 @@ static int ftx232_spi_transfer_one(struct spi_master *ctlr, struct spi_device *s
 
   packet->len = 0;
 
+  spin_lock(&priv->lock);
   if(spi->mode & SPI_CPOL) {
     priv->pinstate |= 1 << GPIO_CLK;
   } else {
     priv->pinstate &= ~(1 << GPIO_CLK);
   }
+  spin_unlock(&priv->lock);
   ftx232_fill_gpio_cmd(priv, packet, spi->chip_select, spi->mode & SPI_CS_HIGH);
 
   cmd = MPSSE_DO_WRITE | MPSSE_DO_READ;
@@ -213,7 +218,9 @@ static int ftx232_gpio_direction_output(struct gpio_chip *chip, unsigned offset,
   struct ftdi_priv *priv;
 
   priv = gpiochip_get_data(chip);
+  spin_lock(&priv->lock);
   priv->pindir |= 1 << (offset + GPIO_OFFSET);
+  spin_unlock(&priv->lock);
   ftx232_gpio_chip_set(chip, offset, value);
   return 0;
 }
@@ -322,6 +329,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
     printk("devm_gpiochip: %d\n", ret);
   }
 
+  spin_lock_init(&priv->lock);
   INIT_WORK(&priv->register_spi_ctrl, ftx232_register_spi_ctrl);
   printk("Channel %x\r\n", priv->channel);
 
@@ -330,6 +338,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
     printk("could not allocate urb\r\n");
     return -ENOMEM;
   }
+
 
   // reset FTDI
   priv->req.bRequestType = USB_TYPE_VENDOR | USB_DIR_OUT;
