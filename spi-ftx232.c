@@ -23,6 +23,8 @@
 #define GPIO_CLK 0
 #define GPIO_OFFSET 3
 
+#define GPIO_LABEL_MAX_LEN 32
+
 struct ftdi_usb_packet {
   u8 data[4096];
   int len;
@@ -405,9 +407,8 @@ static int ftx232_gpio_get(struct gpio_chip *chip, unsigned offset) {
 static ssize_t export_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t len) {
   struct spi_device *spi_device;
   struct ftdi_priv *priv;
-  struct ftdi_usb_packet *packet;
-  struct urb *urb;
   char modalias[SPI_NAME_SIZE];
+  char label[32];
   u32 chip_select;
   u32 mode;
   u32 max_speed_hz;
@@ -435,7 +436,6 @@ static ssize_t export_store(struct device *dev, struct device_attribute *attr, c
     printk("spi_add_device: %d\n", ret);
   }
 
-  char label[32];
   snprintf(label, sizeof(label), "ftx232 chan %d cs %d", priv->channel, chip_select);
   gpiochip_request_own_desc(
       &priv->gpio_chip,
@@ -472,6 +472,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   struct usb_host_interface *settings;
   int ret;
   struct ftdi_priv *priv;
+  char *label;
 
   settings = usb_if->cur_altsetting;
 
@@ -492,11 +493,12 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   priv->pindir = 0b011; // MISO in, MOSI out, CLK out
   priv->channel = settings->desc.bInterfaceNumber + 1;
 
-  priv->gpio_chip.label = kmalloc(32, GFP_KERNEL);
-  if(!priv->gpio_chip.label) {
+  label = kmalloc(GPIO_LABEL_MAX_LEN, GFP_KERNEL);
+  if(!label) {
     return -ENOMEM;
   }
-  snprintf(priv->gpio_chip.label, 32, "ftx232 chan %d", priv->channel);
+  snprintf(label, GPIO_LABEL_MAX_LEN, "ftx232 chan %d", priv->channel);
+  priv->gpio_chip.label = label;
 
   priv->gpio_chip.owner = THIS_MODULE;
   priv->gpio_chip.ngpio = 13;
