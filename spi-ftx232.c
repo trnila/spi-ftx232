@@ -25,6 +25,11 @@
 
 #define GPIO_LABEL_MAX_LEN 32
 
+#define USB_PRODUCT_FT2232 0x6010
+#define USB_PRODUCT_FT4232 0x6011
+#define FT2232_GPIOS 13
+#define FT4232_GPIOS 5
+
 struct ftdi_usb_packet {
   u8 data[4096];
   int len;
@@ -473,8 +478,25 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   int ret;
   struct ftdi_priv *priv;
   char *label;
+  u8 channel;
+  u16 ngpio;
 
   settings = usb_if->cur_altsetting;
+
+  // only first two channels has support for MPSSE/SPI
+  channel = settings->desc.bInterfaceNumber + 1;
+  if(channel > 2) {
+    return -ENODEV;
+  }
+
+  if(usb_id->idProduct == USB_PRODUCT_FT2232) {
+    ngpio = FT2232_GPIOS;
+  } else if(usb_id->idProduct == USB_PRODUCT_FT4232) {
+    ngpio = FT4232_GPIOS;
+  } else {
+    printk("Unsupported usb device idProduct %x", usb_id->idProduct);
+    return -ENODEV;
+  }
 
   master = spi_alloc_master(&usb_if->dev, sizeof(struct ftdi_priv));
   if(!master) {
@@ -483,7 +505,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   }
   master->transfer_one = ftx232_spi_transfer_one;
   master->setup = ftx232_spi_setup;
-  master->num_chipselect = 13;
+  master->num_chipselect = ngpio;
   master->mode_bits |= SPI_CS_HIGH | SPI_CPOL | SPI_CPHA;
 
   priv = spi_master_get_devdata(master);
@@ -491,7 +513,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   priv->spi_controller = master;
   priv->usb_dev = udev;
   priv->pindir = 0b011; // MISO in, MOSI out, CLK out
-  priv->channel = settings->desc.bInterfaceNumber + 1;
+  priv->channel = channel;
 
   label = kmalloc(GPIO_LABEL_MAX_LEN, GFP_KERNEL);
   if(!label) {
@@ -501,7 +523,7 @@ static int ftx232_usb_probe(struct usb_interface* usb_if, const struct usb_devic
   priv->gpio_chip.label = label;
 
   priv->gpio_chip.owner = THIS_MODULE;
-  priv->gpio_chip.ngpio = 13;
+  priv->gpio_chip.ngpio = ngpio;
   priv->gpio_chip.base = -1;
   priv->gpio_chip.direction_output = ftx232_gpio_direction_output;
   priv->gpio_chip.set = ftx232_gpio_chip_set;
@@ -550,6 +572,7 @@ static void ftx232_usb_disconnect(struct usb_interface *usb_if) {
 
 static const struct usb_device_id ftx232_usb_table[] = {
   { USB_DEVICE(0x0403, 0x6010) },
+  { USB_DEVICE(0x0403, 0x6011) },
   { }
 };
 
