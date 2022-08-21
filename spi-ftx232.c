@@ -280,7 +280,7 @@ void ftx232_gpio_chip_set(struct gpio_chip *chip, unsigned offset, int value) {
   urb = usb_alloc_urb(0, GFP_KERNEL);
   if(!urb) {
     printk("could not allocate urb\r\n");
-    return -ENOMEM;
+    return;
   }
 
   packet = kmalloc(sizeof(*packet), GFP_KERNEL);
